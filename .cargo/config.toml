@@ -1,0 +1,4 @@
+# The target is a 2007 Core2 Duo T7400: x86-64-v1, SSSE3 at most.
+# Never use `target-cpu=native` here — the build host is a modern Mac.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "target-cpu=x86-64"]

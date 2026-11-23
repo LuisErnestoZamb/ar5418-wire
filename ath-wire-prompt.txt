@@ -1,0 +1,158 @@
+# Proyecto: crate `ath9k-wire` — driver Wi-Fi Atheros AR5418 para un OS from-scratch en Rust
+
+## 1. Contexto
+
+Tenemos un OS escrito desde cero en Rust (`reemplazo`) que arranca un MacBook2,1 de 2007.
+No es Linux, no usa otro kernel y no tiene capa de compatibilidad con Linux. Ya corren:
+kernel + drivers DMA/PIO propios (sky2, e1000, UHCI/USB, AHCI, ATA-PIO, PCI-IDE ICH7),
+red (smoltcp → DHCP/DNS/TCP/TLS), shell, editor, browser, git, sshd, instalador,
+y userland con ELF en ring 3 + syscalls `int 0x80`.
+
+Hardware objetivo (constraints fijos):
+- CPU: Core2 Duo T7400 (Merom). **Baseline x86-64-v1**: sin SSE4.1/4.2, POPCNT ni AVX.
+  Jamás `-C target-cpu=native` (build en Mac moderno, ejecución en 2007).
+- 2,9 GB RAM DDR2, disco 5400rpm (el cuello de botella).
+- Chipset ICH7 **sin IOMMU**: por eso los drivers de dispositivos con DMA
+  (incluido el Wi-Fi) **viven en ring 0**. El usuario accede por syscalls
+  de red (`net::register` + sock/DNS/TLS 16..21) ya implementadas.
+- Tarjeta Wi-Fi: **Atheros AR5418** (PCI `168c:0024`, clase `0280`), detección
+  por el inventario de hardware del kernel. Lista en el log de bring-up actual
+  como `NEEDS_DRIVER`. Sin credenciales de red aún.
+
+## 2. El problema a resolver
+
+Nuestro inventario de hardware registra 4 dispositivos sin driver:
+
+| ID | Dispositivo | Estado |
+|---|---|---|
+| `168c:0024` | Atheros AR5418 Wi-Fi | **este proyecto** |
+| `8086:27d8` | HDA audio | fuera de alcance |
+| `11c1:5811` | FireWire | fuera de alcance |
+| `8086:27a3` | SD host | fuera de alcance (MMIO ilegible en este hardware) |
+
+Queremos: **asociar la AR5418 a un AP y que el stack existente haga DHCP → DNS → TCP/TLS
+sobre Wi-Fi**, tal como ya hace por cable con `sky2`. Objetivo secundario: ver la
+conectividad en pantalla y en el log persistente.
+
+## 3. Qué NO hay (ya verificado, no volver a buscar a ciegas)
+
+- **No existe ningún crate `ath9k` en crates.io** (`total: 0`).
+- No hay driver de controladora Wi-Fi usable en Rust ni para `no_std`. Lo que hay:
+  - `ieee80211` 0.5.x → parser de frames 802.11 (útil para RX/TX, no es driver).
+  - `libwifi` → parseo, asume Linux.
+  - `foa`, `esp-wifi`, `esp-radio` → solo ESP32.
+  - `wl-nl80211` / `nl80211-rs` → netlink a `cfg80211`, requiere kernel Linux.
+  - `radiotap`, `simple_wifi` → parseo de capturas.
+- El driver `ath9k` existe solo como C en el árbol de Linux
+  (`drivers/net/wireless/ath/ath9k`), acoplado a `mac80211` + `cfg80211` +
+  `wpa_supplicant`. **No se puede instalar un `.ko` en este OS**: es un objeto
+  ELF con símbolos sin resolver (`printk`, `kmalloc`, `request_irq`, `netif_rx`,
+  `ieee80211_*`, workqueues, `sk_buff`…) compilado para el ABI interno de Linux.
+- **ath9k no necesita firmware** (a diferencia de ath10k). El bloqueo real es
+  programación de registros MAC/BB, rings DMA TX/RX, calibración/ANI y luego el
+  estado 802.11 + crypto.
+
+Conclusión del patrón de reutilización usado en `reemplazo`: en vez de copiar
+drivers, **implementar el protocolo alámbrico como crate propio y auditable**
+(ahci-wire, usbwire, ssh-wire, git-pack, net, gptwire, fat). Este proyecto sigue
+ese patrón: `ath-wire` (registros/EEPROM/DMA de Atheros) + `ath9k-mac` (estado
+802.11), sin arrastrar `mac80211`.
+
+## 4. Objetivo del crate (scope)
+
+Crear un **crate `ath-wire`** (nombre recomendado; Ver §10), `no_std`, sin alloc
+o con alloc opcional, independiente de Linux, que permita a un kernel tipo Rust
+comprobar y operar la tarjeta:
+
+- **Nivel 1 — probe**: reset, lectura de revisiones de chip (AR5xxx), EEPROM/OTP,
+  dirección MAC, listado de canales/reglas de dominio. Todo legible y verificable
+  por log.
+- **Nivel 2 — RX**: inicializar ring RX (descriptores), enable recepción,
+  capturar beacons/probe responses y parsearlos (SSID, canal, capacidad, RSN).
+- **Nivel 3 — TX**: ring TX, construcción de frames de gestión, ACK + reintentos,
+  selección de tasa.
+- **Nivel 4 — asociación + WPA2-PSK**: authentication abierta, association,
+  handshake EAPOL 4-way, derivación PMK/PTK (PBKDF2), programación de claves
+  CCMP en el hardware, contadores de replay.
+- **Nivel 5 — bridge al stack**: entregar/aceptar payloads Ethernet para que
+  el kernel consuma la interfaz ya existente (smoltcp).
+
+### No-objetivos (explicitar para no inflarse)
+- Sin WPA3/SAE, sin roaming, sin power save, sin AMPDU/agregación.
+- Sin AP/hostapd (solo STA).
+- Sin multi-AP/multi-SSID, sin gestión de perfiles fuera de una configuración fija.
+- Sin portar `mac80211` completo.
+- Si en cualquier nivel el esfuerzo supera lo razonable → **abortar y documentar**
+  en vez de entregar código a medias.
+
+## 5. Arquitectura y constraints de diseño
+
+- `no_std`, `x86_64-unknown-none`, baseline **x86-64-v1** (SSSE3 máximo).
+- Punto de extensión: el kernel expone `net::Nic` + `net::Stack` y ya hay un
+  `Register`/`register` para entregar la interfaz al stack. El crate debe exponer
+  una API del tipo:
+  `init(pci_config/mmio) -> Device`, `poll(&mut self)` o callback IRQ,
+  `tx(&[u8])`, `rx(&mut [u8]) -> Option<usize>`, `scan()`, `connect(ssid, psk)`.
+- Conmutación con `interrupts` del kernel: el driver debe funcionar con **IRQ del
+  PCI (MSI/legacy INTx)** y con un modo de sondeo de respaldo acotado (bounded
+  polls: cada espera tiene presupuesto; nunca un `loop` infinito en boot).
+- Memoria DMA: alinear buffers a 4 KiB, `volatile`/`write_volatile`,
+  barreras donde la memoria ordenada no se da por defecto.
+- Sin IOMMU → el driver recibe acceso crudo a MMIO/DMA. Aislar la API para que
+  un kernel anfitrión pueda inyectar los primitivos I/O (trait `Mmio`/`Dma`/`Timer`
+  + ISR), de modo que el crate sea testeable en host con mocks y no dependa de
+  nuestro kernel.
+
+## 6. Fases sugeridas (cada una con criterio de aceptación)
+
+- **F0 — scaffold**: crate + traits de plataforma + CI (`cargo check`,
+  `clippy -D warnings`, tests de host). Criterio: compila `no_std`.
+- **F1 — PCI + probe**: leer config, BAR, identificar chip y EEPROM/MAC.
+  Criterio: impresión/`log` de `rev=… mac=… channels=…` verificable.
+- **F2 — rings RX**: recibir beacons. Criterio: contador de beacons > 0 y
+  SSID/canal parseados.
+- **F3 — TX**: transmitir probe request. Criterio: respuesta recibida.
+- **F4 — asociación abierta**: criterio: `LINK_UP` con AP sin cifrado.
+- **F5 — WPA2-PSK**: 4-way + claves. Criterio: tráfico IP con cifrado.
+- **F6 — integración**: entregar al stack del OS, DHCP → ping → TCP/TLS.
+
+Cada fase: doc (`DESIGN.md` por fase), tests, y registro de riesgos.
+
+## 7. Verificación
+
+- **QEMU no emula la AR5418**: las fases F1+ se validan en el hardware real.
+  Plan de validación: log persistente de `reemplazo` (ya existe:
+  región de disco con cabecera `REEMPLAZO-LOG-v1`, sectores de 512 B,
+  comandos `cargo xtask readlog` / `provisionlog`) + netlog por TCP + SSH.
+- Tests unitarios de host para todo lo que no requiera hardware:
+  parseo de EEPROM, construir/parsear frames, KDF de WPA2 (vector de prueba
+  RFC/802.11i), descriptores DMA, máquina de estados con registro simulado.
+- Gates antes de cada commit: `cargo fmt --check`, `clippy -D warnings`,
+  `cargo test`, y un smoke donde sea posible.
+
+## 8. Riesgos conocidos
+
+- AR5418 = familia AR5008; hay que confirmar sub-revisión y variantes de EEPROM
+  (puede haber calibration file / EEPROM inexistente en modo OTP).
+- DMA/ordenación de memoria en Merom; IRQ compartida con el chipset.
+- Calibración RF: sin datos correctos, TX puede fallar silenciosamente →
+  por eso F1 incluye EEPROM y F3 es criterio de aceptación propio.
+- El hardware está sin credenciales y el AP real es externo: necesitaremos
+  SSID/clave y la tarjeta debe poderse poner en modo monitor para diagnóstico.
+
+## 9. Pregunta de alcance inicial
+
+Antes de empezar, confirma: ¿**F1 (probe + EEPROM + MAC + canal)** como primer
+milestone con criterio de aceptación en log? Es lo más pequeño verificable sin
+hardware de red, y nos dice si el resto es viable. Si F1 ya no cabe en un
+crate aislado, el proyecto se detiene ahí en lugar de producir código a medias.
+
+## 10. Nombre del proyecto (decisión de la conversación)
+
+- Repo / crate principal: **`ath-wire`** — coherente con `ahci-wire`, `usbwire`,
+  `ssh-wire`; describe registros/EEPROM/DMA sin prometer un port de Linux.
+- Si hace falta un segundo crate: **`wlan-mgmt`** — state machine 802.11 +
+  auth/assoc + WPA2, reutilizable con otra NIC.
+- Título sugerido del repo: `ath-wire — Atheros AR5418 (168c:0024) bring-up for a no_std Rust kernel`.
+- Evitar `ath9k-rs` (sugiere port del driver Linux) y `ar5418-wire` (demasiado
+  atado a un solo chip).

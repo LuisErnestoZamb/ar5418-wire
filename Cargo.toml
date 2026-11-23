@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["ath-wire"]
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+# The crate is `no_std`; release builds for the target never unwind.
+[profile.release]
+panic = "abort"
